@@ -1,0 +1,663 @@
+---
+title: "Credit Risk project - binary classification models comparison"
+author: "Mateusz Majak, Huseyin Can Minareci, Damian Żamojda"
+date: "11 06 2021"
+output: 
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+As a final project, using the knowledge gained from the classes, we will compare several binary classification models using dataset consisting binary target variable.
+
+Purpose of the models will be to predict next-day rain by training classification models on the target variable RainTomorrow.
+
+
+# About the dataset
+The dataset used in this project contains about 10 years of daily weather observations from many locations across Australia. It was shared by Joe Young on the Kaggle 
+platform and is available [here](`https://www.kaggle.com/jsphyg/weather-dataset-rattle-package`).
+
+# Preparations {.tabset .tabset-fade .tabset-pills}
+
+## Load libraries
+We load multiple libraries for data manipulation and visualisation together with 
+tools for data modelling.
+
+```{r message = FALSE}
+# data manipulation
+library(tidyverse)
+library(tidyr)
+library(mice)
+#visualizations
+library(ggplot2)
+library(ggthemes)
+library(scales)
+library(extrafont)
+library(viridis)
+loadfonts()
+library(gridExtra)
+library(grid)
+#modeling
+library(caret)
+library(corrplot)
+library(gbm)
+library(xgboost)
+library(here)
+```
+
+## Load Data
+We load the whole data from csv files.
+```{r message = FALSE}
+rain_data <- read.csv("weatherAUS.csv")
+```
+
+## Data manipulation
+We change column data types and deal with NAs when needed.
+
+```{r, fig.height = 6}
+#Data types convertion
+rain_data$Date <- as.Date(rain_data$Date)
+rain_data$Location <- as.factor(rain_data$Location)
+rain_data$RainToday <- as.factor(rain_data$RainToday)
+rain_data$RainTomorrow <- as.factor(rain_data$RainTomorrow)
+rain_data$WindGustDir <- as.factor(rain_data$WindGustDir)
+rain_data$WindDir9am <- as.factor(rain_data$WindDir9am)
+rain_data$WindDir3pm <- as.factor(rain_data$WindDir3pm)
+#NA values
+colSums(is.na(rain_data)) %>% 
+  sort()
+
+table(rain_data$RainToday, useNA = "ifany")
+table(rain_data$RainTomorrow, useNA = "ifany")
+
+#There are many NA values, thus we deal with it in the next steps
+
+```
+
+# Data preview {.tabset .tabset-fade .tabset-pills}
+The dataset contains **`r format(dim(rain_data)[1], nsmall=1, big.mark=" ") `** rows and **`r dim(rain_data)[2]`** columns.
+
+This is how it looks like:
+
+```{r}
+glimpse(rain_data)
+
+head(rain_data)
+```
+
+# Missing values
+
+
+```{r}
+library(naniar)
+
+rain_data %>% 
+gg_miss_span(RainTomorrow, 
+             span_every = 30000, 
+             facet = Location)
+```
+
+There are 2 cities containing significant number of missing values in dependent variable: Melbourne and Williamtown.
+We consider removing all rows with the data from these cities or just rows with NA values.
+For now we will keep all the data, but we save information about rows with the null dependent variable.
+
+``` {r}
+
+NA_cities <- which(is.na(rain_data$RainTomorrow))
+rain_data[NA_cities[1:10],]
+
+
+```
+
+Additionally, we check other variables for missing values.
+
+``` {r}
+gg_miss_fct(x = rain_data, fct = Location) + labs(title = "NA values in per each variable and city")
+
+```
+
+It seems there are a lot of NA values in Sunshine, Evaporation, Cloud9am and Cloud3pm columns.
+
+# Data division
+
+```{r}
+set.seed(987654321)
+
+rain_which_train <- createDataPartition(rain_data$RainTomorrow,
+                                          p = 0.7, 
+                                          list = FALSE) 
+
+rain_train <- rain_data[rain_which_train,]
+rain_test <- rain_data[-rain_which_train,]
+
+prop.table(table(rain_data$RainTomorrow))
+prop.table(table(rain_train$RainTomorrow))
+prop.table(table(rain_test$RainTomorrow))
+
+```
+
+Proportion of target variable didn't significantly change after splitting the dataset.
+
+# EDA
+
+## Variables division by type
+
+We group variables by type and save them into list to analyze them later.
+
+```{r, warning=FALSE}
+# some plots here (histogram, relationships with the independent variables?)
+rain_numeric_vars <- 
+  sapply(rain_train, is.numeric) %>% 
+  which() %>% 
+  names()
+
+rain_factor_vars <- 
+  sapply(rain_train, is.factor) %>% 
+  which() %>% 
+  names()
+
+rain_factor_vars <- rain_factor_vars[1:5]
+
+rain_numeric_vars
+rain_factor_vars
+
+```
+
+## Correlation
+
+```{r}
+rain_correlations <- 
+  cor(rain_train[,rain_numeric_vars],
+      use = "pairwise.complete.obs")
+
+rain_numeric_vars_order <- 
+  rain_train[,"RainTomorrow"] %>% 
+  sort(decreasing = TRUE) %>%
+  names()
+
+corrplot.mixed(rain_correlations,
+               upper = "circle",
+               lower = "pie",
+               tl.col="black",
+               tl.pos = "lt",
+               tl.cex = 0.6)
+```
+
+We can see that there are a few groups of variables highly correlated with each other.
+Temp3am, Temp9am, MinTemp and MaxTemp are positively correlated which is quite intuitive.
+Pressure3pm is positively correlated with Pressure9am which is also intuitive.
+Finally, Cloud9am and Cloud3pm are negatively correlated with Sunshine, which is intuitive as well.
+
+## Dependent variable
+
+```{r}
+ggplot(rain_train) + geom_bar(aes(x = RainTomorrow))
+```
+
+Variable is unbalanced, we will consider dealing with it later.
+
+## Independent Variables
+
+### Numeric variables
+
+```{r, warning=FALSE, message=FALSE, fig.height=25, fig.width=10}
+p1 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=MinTemp, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p2 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=MaxTemp, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p3 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Rainfall, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p4 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Evaporation, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p5 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Sunshine, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p6 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=WindGustSpeed, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p7 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=WindSpeed9am, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p8 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=WindSpeed3pm, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p9 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Humidity9am, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p10 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Humidity3pm, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p11 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Pressure9am, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p12 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Pressure3pm, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p13 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Cloud9am, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p14 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Cloud3pm, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p15 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Temp9am, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+p16 <- 
+  rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(x=RainTomorrow, y=Temp3pm, fill= RainTomorrow)) + geom_violin() + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+
+
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, p8, 
+             p9, p10, p11, p12, p13, p14, p15, p16, 
+             nrow = 8, ncol = 2)
+```
+We can visually recognize differences between distributions of Sunshine, Cloud9am,
+Cloud3pm and humidity variables with the target variable on the x axis.
+
+### Factor variables
+
+```{r warning=FALSE, message=FALSE, fig.width=10, fig.height=20}
+fp1 <- rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(fill = RainTomorrow)) + 
+  geom_bar(aes(y = Location)) +
+  scale_x_discrete(expand = c(0, 0)) + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+fp2 <- rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(fill = RainTomorrow)) + 
+  geom_bar(aes(y = WindGustDir)) +
+  scale_x_discrete(expand = c(0, 0)) + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+fp3 <- rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(fill = RainTomorrow)) + 
+  geom_bar(aes(y = WindDir9am)) +
+  scale_x_discrete(expand = c(0, 0)) + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+fp4 <- rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(fill = RainTomorrow)) + 
+  geom_bar(aes(y = WindDir3pm)) +
+  scale_x_discrete(expand = c(0, 0)) + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+fp5 <- rain_train %>% 
+  dplyr::filter(!is.na(RainTomorrow)) %>% 
+  ggplot(aes(fill = RainTomorrow)) + 
+  geom_bar(aes(y = RainToday)) +
+  scale_x_discrete(expand = c(0, 0)) + scale_fill_viridis(discrete=TRUE, option="viridis") + scale_color_viridis(option="viridis") +  theme_bw()
+
+grid.arrange(fp1, fp2, fp3, fp4, fp5, 
+             nrow = 3, ncol = 2)
+
+```
+
+
+# Modeling
+
+## Data Preparation
+
+```{r}
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+rain_train$MinTemp <- replace_na(rain_train$MinTemp, mean(rain_train$MinTemp, na.rm=TRUE))
+rain_train$MaxTemp <- replace_na(rain_train$MaxTemp, mean(rain_train$MaxTemp, na.rm=TRUE))
+rain_train$Rainfall <- replace_na(rain_train$Rainfall, mean(rain_train$Rainfall, na.rm=TRUE))
+rain_train$Evaporation <- replace_na(rain_train$Evaporation, mean(rain_train$Evaporation, na.rm=TRUE))
+rain_train$Sunshine <- replace_na(rain_train$Sunshine, mean(rain_train$Sunshine, na.rm=TRUE))
+rain_train$WindGustDir <- replace_na(rain_train$WindGustDir, getmode(rain_train$WindGustDir))
+rain_train$WindGustSpeed <- replace_na(rain_train$WindGustSpeed, mean(rain_train$WindGustSpeed, na.rm=TRUE))
+rain_train$WindDir9am <- replace_na(rain_train$WindDir9am, getmode(rain_train$WindDir9am))
+rain_train$WindDir3pm <- replace_na(rain_train$WindDir3pm, getmode(rain_train$WindDir3pm))
+rain_train$WindSpeed9am <- replace_na(rain_train$WindSpeed9am, mean(rain_train$WindSpeed9am, na.rm=TRUE))
+rain_train$WindSpeed3pm <- replace_na(rain_train$WindSpeed3pm, mean(rain_train$WindSpeed3pm, na.rm=TRUE))
+rain_train$Humidity9am <- replace_na(rain_train$Humidity9am, mean(rain_train$Humidity9am, na.rm=TRUE))
+rain_train$Pressure9am <- replace_na(rain_train$Pressure9am, mean(rain_train$Pressure9am, na.rm=TRUE))
+rain_train$Cloud9am <- replace_na(rain_train$Cloud9am, mean(rain_train$Cloud9am, na.rm=TRUE))
+rain_train$Cloud3pm <- replace_na(rain_train$Cloud3pm, mean(rain_train$Cloud3pm, na.rm=TRUE))
+rain_train$Temp9am <- replace_na(rain_train$Temp9am, mean(rain_train$Temp9am, na.rm=TRUE))
+rain_train$Temp3pm <- replace_na(rain_train$Temp3pm, mean(rain_train$Temp3pm, na.rm=TRUE))
+rain_train$RainToday <- replace_na(rain_train$RainToday, getmode(rain_train$RainToday))
+rain_train <- rain_train %>% filter(!is.na(rain_train$RainTomorrow))
+sapply(rain_train, function(x) sum(is.na(x)))
+
+rain_test$MinTemp <- replace_na(rain_test$MinTemp, mean(rain_test$MinTemp, na.rm=TRUE))
+rain_test$MaxTemp <- replace_na(rain_test$MaxTemp, mean(rain_test$MaxTemp, na.rm=TRUE))
+rain_test$Rainfall <- replace_na(rain_test$Rainfall, mean(rain_test$Rainfall, na.rm=TRUE))
+rain_test$Evaporation <- replace_na(rain_test$Evaporation, mean(rain_test$Evaporation, na.rm=TRUE))
+rain_test$Sunshine <- replace_na(rain_test$Sunshine, mean(rain_test$Sunshine, na.rm=TRUE))
+rain_test$WindGustDir <- replace_na(rain_test$WindGustDir, getmode(rain_test$WindGustDir))
+rain_test$WindGustSpeed <- replace_na(rain_test$WindGustSpeed, mean(rain_test$WindGustSpeed, na.rm=TRUE))
+rain_test$WindDir9am <- replace_na(rain_test$WindDir9am, getmode(rain_test$WindDir9am))
+rain_test$WindDir3pm <- replace_na(rain_test$WindDir3pm, getmode(rain_test$WindDir3pm))
+rain_test$WindSpeed9am <- replace_na(rain_test$WindSpeed9am, mean(rain_test$WindSpeed9am, na.rm=TRUE))
+rain_test$WindSpeed3pm <- replace_na(rain_test$WindSpeed3pm, mean(rain_test$WindSpeed3pm, na.rm=TRUE))
+rain_test$Humidity9am <- replace_na(rain_test$Humidity9am, mean(rain_test$Humidity9am, na.rm=TRUE))
+rain_test$Pressure9am <- replace_na(rain_test$Pressure9am, mean(rain_test$Pressure9am, na.rm=TRUE))
+rain_test$Cloud9am <- replace_na(rain_test$Cloud9am, mean(rain_test$Cloud9am, na.rm=TRUE))
+rain_test$Cloud3pm <- replace_na(rain_test$Cloud3pm, mean(rain_test$Cloud3pm, na.rm=TRUE))
+rain_test$Temp9am <- replace_na(rain_test$Temp9am, mean(rain_test$Temp9am, na.rm=TRUE))
+rain_test$Temp3pm <- replace_na(rain_test$Temp3pm, mean(rain_test$Temp3pm, na.rm=TRUE))
+rain_test$RainToday <- replace_na(rain_test$RainToday, getmode(rain_test$RainToday))
+rain_test <- rain_test %>% filter(!is.na(rain_test$RainTomorrow))
+sapply(rain_test, function(x) sum(is.na(x)))
+```
+
+```{r message=FALSE, echo=FALSE, warning=FALSE, results='hide'}
+colnames(rain_train)
+
+model.formula <- RainTomorrow ~ MinTemp + MaxTemp + Rainfall + Evaporation + Sunshine + WindGustSpeed + WindDir9am + WindDir3pm + WindSpeed9am + WindSpeed3pm + Humidity9am + Pressure9am + Cloud9am + Cloud3pm + Temp9am + Temp3pm + RainToday
+```
+
+
+## GBM
+
+The range of parameters for Cross-Validation was adopted as below and the training of the model was started.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+parameters_gbm <- expand.grid(interaction.depth = c(1, 2, 3),
+                             n.trees = c(100, 500),
+                             shrinkage = c(0.01, 0.1), 
+                             n.minobsinnode = c(100, 250, 500))
+ctrl_cv3 <- trainControl(method = "cv", 
+                         number = 3,
+                         classProbs = TRUE,
+                         summaryFunction = twoClassSummary)
+```
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+
+if (0) {
+  set.seed(123456789)
+  
+  Rain.gbm  <- train(model.formula,
+                         data = rain_train,
+                         distribution = "bernoulli",
+                         method = "gbm",
+                         tuneGrid = parameters_gbm,
+                         trControl = ctrl_cv3,
+                         verbose = FALSE)
+  
+  saveRDS(object = Rain.gbm,
+          file   = here("Rain.gbm.rds"))
+}
+Rain.gbm <- readRDS(here("Rain.gbm.rds"))
+Rain.gbm
+```
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+rain.pred.train.gbm <- predict(Rain.gbm,
+                                  rain_train, 
+                                  type = "prob",
+                                  n.trees = 500)
+
+rain.pred.test.gbm <- predict(Rain.gbm,
+                                 rain_test, 
+                                 type = "prob",
+                                 n.trees = 500)
+```
+
+### Results
+
+#### Gini 
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+ROC.train.gbm <- 
+  pROC::roc(rain_train$RainTomorrow, 
+            rain.pred.train.gbm$Yes)
+ROC.test.gbm  <- 
+  pROC::roc(rain_test$RainTomorrow, 
+            rain.pred.test.gbm$Yes)
+library(pROC)
+list(
+  ROC.train.gbm = ROC.train.gbm,
+  ROC.test.gbm  = ROC.test.gbm
+) %>%
+  pROC::ggroc(alpha = 0.5, linetype = 1, size = 1) + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), 
+               color = "grey", 
+               linetype = "dashed") +
+  labs(subtitle = paste0("Gini TRAIN: ",
+                         "gbm = ", 
+                         round(100 * (2 * auc(ROC.train.gbm) - 1), 1), "%, ",
+                         "Gini TEST: ",
+                         "gbm = ", 
+                         round(100 * (2 * auc(ROC.test.gbm) - 1), 1), "%, "
+  )) +
+  theme_bw() + coord_fixed() +
+  scale_color_brewer(palette = "Paired")
+```
+
+Because of unbalanced data we decided to take the geometric mean of sensitivity and specificity in order to find the balance between them, so we could have the most desirable threshold.
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+gmeans.gbm <- sqrt(ROC.test.gbm$sensitivities * ROC.test.gbm$specificities)
+opt.th.gbm <- ROC.test.gbm$thresholds[which.max(gmeans.gbm)]
+opt.th.gbm
+```
+
+After finding the optimal threshold we decided to classify predictions 1 and 0 with that threshold in order to calculate the confusion matrix and evaluate our model.
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+rain.pred.test.gbm.bin <- ifelse(rain.pred.test.gbm$Yes>opt.th.gbm,1,0)
+
+rain_test_bin <- ifelse(rain_test$RainTomorrow=="Yes",1,0)
+```
+
+
+#### Confusion Matrix
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+gbm.cm <- confusionMatrix(factor(rain.pred.test.gbm.bin), factor(rain_test_bin))
+gbm.cm
+prec.gbm <- gbm.cm$table[2,2] / (gbm.cm$table[2,2] + gbm.cm$table[2,1])
+recall.gbm <- gbm.cm$table[2,2] / (gbm.cm$table[2,2] + gbm.cm$table[1,2])
+f1.gbm <- 2 * ((prec.gbm * recall.gbm) / (prec.gbm + recall.gbm))
+```
+
+We can see from our confusion matrix that the accuracy of the model is 78%, Sensitivity 0.7845 and Specificity : 0.7667. Kappa coefficient is 0.4662 which indicates there is moderate agreement between frequencies of two sets of data.  
+
+Precision: `r gbm.cm$byClass[5] `  
+Recall: `r gbm.cm$byClass[6] `  
+F-1 Score: `r gbm.cm$byClass[7] `  
+  
+
+
+## XGBoost
+
+
+Due to the unsatisfactory effects on the default parameters, it was decided to tune the XGBoost model. The process began with finding the optimal minimal child weight and then jumped to other ones. 
+
+In the next steps, a wide variety of parameters were used for validation and proceeded with the most efficient one while changing the validated parameter for the very next one.
+
+The final version of the model is presented in the code below.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+parameters_xgb <- expand.grid(nrounds = 100,
+                             max_depth = 6,
+                             eta = 0.3, 
+                             gamma = 0,
+                             colsample_bytree = 1,
+                             min_child_weight = 1,
+                             subsample = 0.9)
+ctrl_cv3 <- trainControl(method = "cv", 
+                         number = 3,
+                         classProbs = TRUE,
+                         summaryFunction = twoClassSummary)
+```
+
+```{r message=FALSE, warning=FALSE}
+if (0) {
+  Rain.xgb <- train(model.formula,
+                     data = rain_train,
+                     method = "xgbTree",
+                     trControl = ctrl_cv3,
+                     tuneGrid  = parameters_xgb)
+  Rain.xgb
+  Rain.xgb %>% saveRDS(here("Rain.xgb.rds"))
+}
+Rain.xgb <- readRDS(here("Rain.xgb.rds"))
+Rain.xgb
+```
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+rain.pred.train.xgb <- predict(Rain.xgb,
+                                  rain_train, 
+                                  type = "prob",
+                                  n.trees = 500)
+
+rain.pred.test.xgb <- predict(Rain.xgb,
+                                 rain_test, 
+                                 type = "prob",
+                                 n.trees = 500)
+```
+
+### Results
+
+#### Gini
+
+After several attempts, it was possible to obtain the most optimal model.
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+Rain.train.xgb <- pROC::roc(rain_train$RainTomorrow, 
+                           predict(Rain.xgb,
+                                   rain_train, 
+                                   type = "prob",
+                                   n.trees = 500)[, "Yes"])
+
+
+Rain.test.xgb  <- pROC::roc(rain_test$RainTomorrow, 
+                           predict(Rain.xgb,
+                                   rain_test, 
+                                   type = "prob",
+                                   n.trees = 500)[, "Yes"])
+
+list(
+  Rain.train.xgb = Rain.train.xgb,
+  Rain.test.xgb = Rain.test.xgb
+) %>%
+  pROC::ggroc(alpha = 0.5, linetype = 1, size = 1) + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), 
+               color = "grey", 
+               linetype = "dashed") +
+  labs(subtitle = paste0("Gini TRAIN: ",
+                         "xgb = ", 
+                         round(100 * (2 * auc(Rain.train.xgb) - 1), 1), "%, ",
+                         "TEST: ",
+                         "xgb = ", 
+                         round(100 * (2 * auc(Rain.test.xgb) - 1), 1), "%")) +
+  theme_bw() + coord_fixed() +
+  scale_color_brewer(palette = "Paired")
+```
+
+We will take the geometric mean in order to find the balance between the sensitivity and the specificity, so we could have the most desirable threshold.
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+gmeans.xgb <- sqrt(Rain.test.xgb$sensitivities * Rain.test.xgb$specificities)
+opt.th.xgb <- Rain.test.xgb$thresholds[which.max(gmeans.xgb)]
+opt.th.xgb
+```
+
+After finding the optimal threshold we decided to classify predictions 1 and 0 with that threshold in order to calculate the confusion matrix and evaluate our model.
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+rain.pred.test.xgb.bin <- ifelse(rain.pred.test.xgb$Yes>opt.th.xgb,1,0)
+
+rain_test_bin <- ifelse(rain_test$RainTomorrow=="Yes",1,0)
+```
+
+
+#### Confusion Matrix
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+xgb.cm <- confusionMatrix(factor(rain.pred.test.xgb.bin), factor(rain_test_bin))
+xgb.cm
+
+```
+
+We can see from our confusion matrix that the accuracy of the model is 77.3%, Sensitivity 0.7845 and Specificity : 0.7667. Kappa coefficient is 0.4671 which indicates there is moderate agreement between frequencies of two sets of data.
+
+Precision: `r xgb.cm$byClass[5] `  
+Recall: `r xgb.cm$byClass[6] `  
+F-1 Score: `r xgb.cm$byClass[7] `  
+
+# Models comparison
+
+
+Both GBM and XGBoost follows the principle of gradient boosting. There are some difference in modeling details. XGBoost uses a more regularized model formalization to control over-fitting, which gives it better performance than GBM.
+
+Another difference is that XGBoost using less computations resources for boosted tree algorithms. And that is also one of the main reason why it is so popular.
+
+In the following table we can see how 2 model performed in our dataset with the following scores.
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+
+comparison <- data.frame(
+  GBM = c(ROC.test.gbm$auc, gbm.cm$overall[1],gbm.cm$byClass[7],gbm.cm$byClass[1],gbm.cm$byClass[2], gbm.cm$overall[2],gbm.cm$byClass[5],gbm.cm$byClass[6]),
+  XGBoost = c(Rain.test.xgb$auc, xgb.cm$overall[1],xgb.cm$byClass[7],xgb.cm$byClass[1],xgb.cm$byClass[2], xgb.cm$overall[2],xgb.cm$byClass[5],xgb.cm$byClass[6])
+
+)
+# rownames(comparison)[1] <- "Threshold"
+rownames(comparison)[1] <- "Area Under the Curve (AUC)"
+df <- data.frame(GBM = opt.th.gbm, XGBoost = opt.th.xgb,row.names = "Threshold")
+comparison <- rbind(df,comparison)
+comparison
+```
+
+
+# Summary
+
+To sum up, in this project we tried to find out which model would perform better on predicting if it is going to rain next day or not based on the dataset from many locations across Australia 10 years of daily weather observations. We used GBM and XGBoost models to do the predictions, ROC curve to find the best threshold and Area Under Curve (AUC), Accuracy, F1 Score, Sensitivity, Specificity, Precision and Recall to evaluate the models. 
+
+According to the results we found out that based in AUC, XGBoost performs better than GBM. If it comes to performance with the optimum thresholds GBM get better scores in Accuracy, F1, Sensitivity and Recall while XGBoost got better scores on Specificity and Precision. In our case we decided to have more balanced and that's why we used geometric mean but threshold can be changed and set up in order to get more true positives or true negatives but every cases would have some penalty which would en up with having either more False negatives or more false positives. 
+
